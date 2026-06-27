@@ -1,0 +1,5 @@
+uvicorn
+fastapi
+Jinja2
+python-dotenv
+cryptography
