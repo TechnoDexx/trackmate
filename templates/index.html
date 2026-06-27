@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Мои контакты</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+<div class="container mt-4">
+    <h1 class="mb-3">Контакты</h1>
+    <form action="/add" method="post" class="row g-3 mb-4">
+        <div class="col-auto"><input name="name" placeholder="Имя" required class="form-control"></div>
+        <div class="col-auto"><input name="phone" placeholder="Телефон" class="form-control"></div>
+        <div class="col-auto"><input name="email" placeholder="Email" class="form-control"></div>
+        <div class="col-auto"><input name="notes" placeholder="Заметки" class="form-control"></div>
+        <div class="col-auto"><input name="tags" placeholder="Теги" class="form-control"></div>
+        <div class="col-auto"><button type="submit" class="btn btn-primary">Добавить</button></div>
+    </form>
+
+    <table class="table table-striped">
+        <thead>
+            <tr>
+                <th>Имя</th>
+                <th>Телефон</th>
+                <th>Email</th>
+                <th>Заметки</th>
+                <th>Теги</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for contact in contacts %}
+        <tr>
+            <td>{{ contact.name }}</td>
+            <td>{{ contact.phone }}</td>
+            <td>{{ contact.email }}</td>
+            <td>{{ contact.notes }}</td>
+            <td>{{ contact.tags }}</td>
+            <td><a href="/delete/{{ contact.id }}" class="btn btn-danger btn-sm">Удалить</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+</body>
+</html>
