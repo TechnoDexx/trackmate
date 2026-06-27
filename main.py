@@ -1,14 +1,19 @@
 # main.py
 # -*- coding: utf-8 -*-
+
+"""
+TrackMate – защищённый менеджер встреч с шифрованием, автосохранением,
+сбором информации о людях через Yandex Search API и функцией безвозвратного
+уничтожения данных.
+"""
+
 import logging
 import os
 import sqlite3
 import uuid
 import json
 import base64
-import shutil
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from fastapi import FastAPI, Form, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from jinja2 import Environment, FileSystemLoader
@@ -16,6 +21,7 @@ from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import httpx  # для запросов к Yandex API
 
 # --- Загрузка переменных окружения ---
 load_dotenv()
@@ -29,6 +35,7 @@ file_handler.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 logger.addHandler(file_handler)
 
+# --- FastAPI приложение ---
 app = FastAPI()
 
 # --- Jinja2 ---
@@ -70,7 +77,7 @@ def init_db():
     try:
         with get_db_connection() as conn:
             c = conn.cursor()
-            # Таблица встреч (поля, которые шифруются: title, description, participants хранятся в зашифрованном виде)
+            # Таблица встреч (шифруются: title, description)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS meetings (
                     id TEXT PRIMARY KEY,
@@ -83,8 +90,7 @@ def init_db():
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Участники теперь хранятся в виде JSON-строки в поле meeting (чтобы не плодить таблицу)
-            # Но для удобства оставим отдельную таблицу участников, но их имена/email тоже шифруются.
+            # Таблица участников (шифруются: name, email, role)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS participants (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,10 +98,34 @@ def init_db():
                     name_enc TEXT NOT NULL,
                     email_enc TEXT,
                     role_enc TEXT,
+                    profile_id INTEGER,
                     FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
                 )
             ''')
-            # Таблица для хранения пароля, соли и настроек dead man's switch
+            # Таблица профилей (досье на людей)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name_enc TEXT NOT NULL,
+                    email_enc TEXT,
+                    phone_enc TEXT,
+                    raw_data_enc TEXT,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # Таблица черновиков (автосохранения)
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS drafts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT,
+                    user_id TEXT NOT NULL,
+                    draft_data TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                )
+            ''')
+            # Таблица секретов (пароль, соль, настройки)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS secrets (
                     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -105,12 +135,9 @@ def init_db():
                     recovery_email TEXT
                 )
             ''')
-            # Проверяем, есть ли уже запись в secrets. Если нет – создаём заглушку (пока без пароля)
+            # Проверяем, есть ли запись в secrets, иначе создаём заглушку
             c.execute("SELECT id FROM secrets WHERE id = 1")
             if not c.fetchone():
-                # Сгенерируем временную соль и хеш для пустого пароля (чтобы структура была)
-                # Но мы будем требовать установки пароля при первом запуске.
-                # Пока вставим фиктивные данные, чтобы таблица существовала.
                 c.execute("INSERT INTO secrets (id, password_hash, salt, last_login) VALUES (1, '', '', CURRENT_TIMESTAMP)")
             conn.commit()
             logger.info("База данных инициализирована")
@@ -120,17 +147,12 @@ def init_db():
 
 init_db()
 
-# --- Глобальная переменная для хранения ключа (в сессии не храним, будем получать из cookie/сессии) ---
-# В FastAPI нет встроенной сессии, поэтому будем хранить ключ в cookie (зашифрованном виде) или в глобальном словаре.
-# Для простоты используем глобальный словарь (в реальном проекте лучше использовать Redis или JWT).
-# Но для демонстрации оставим в памяти.
-# ВНИМАНИЕ: при перезапуске сервера ключ теряется, и данные станут недоступны до нового ввода пароля.
-active_keys = {}  # user_id -> key (bytes)
+# --- Глобальный словарь для хранения ключей шифрования по user_id ---
+active_keys = {}  # user_id -> bytes (ключ)
 
-# --- Функции для работы с паролем и ключом ---
+# --- Функции для работы с паролем ---
 
 def get_salt_and_hash():
-    """Возвращает соль и хеш пароля из БД."""
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT salt, password_hash FROM secrets WHERE id = 1")
@@ -140,18 +162,17 @@ def get_salt_and_hash():
         return None, None
 
 def set_password(password: str):
-    """Устанавливает новый пароль (соль и хеш)."""
     salt = os.urandom(16)
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
     hash_bytes = kdf.derive(password.encode())
     password_hash = base64.urlsafe_b64encode(hash_bytes).decode()
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("UPDATE secrets SET salt = ?, password_hash = ? WHERE id = 1", (base64.urlsafe_b64encode(salt).decode(), password_hash))
+        c.execute("UPDATE secrets SET salt = ?, password_hash = ? WHERE id = 1",
+                  (base64.urlsafe_b64encode(salt).decode(), password_hash))
         conn.commit()
 
 def verify_password(password: str) -> bool:
-    """Проверяет введённый пароль."""
     salt_b64, hash_b64 = get_salt_and_hash()
     if not salt_b64 or not hash_b64:
         return False
@@ -164,34 +185,47 @@ def verify_password(password: str) -> bool:
         return False
 
 def get_key_for_user(user_id: str, password: str) -> bytes:
-    """Генерирует ключ на основе пароля и соли."""
     salt_b64, _ = get_salt_and_hash()
     if not salt_b64:
         raise ValueError("Соль не найдена")
     salt = base64.urlsafe_b64decode(salt_b64)
     return derive_key(password, salt)
 
-# --- Функции работы с БД (с шифрованием) ---
+# --- Вспомогательные функции для шифрования/дешифрования объектов БД ---
 
-def decrypt_meeting(meeting_row, key):
-    """Преобразует строку из БД в словарь с расшифрованными полями."""
-    if not meeting_row:
+def decrypt_meeting(row, key):
+    if not row:
         return None
-    d = dict(meeting_row)
+    d = dict(row)
     d['title'] = decrypt_text(d.pop('title_enc'), key)
     d['description'] = decrypt_text(d.pop('description_enc'), key)
     return d
 
-def decrypt_participant(p_row, key):
-    if not p_row:
+def decrypt_participant(row, key):
+    if not row:
         return None
-    d = dict(p_row)
-    d['name'] = decrypt_text(d.pop('name_enc'), key)
-    d['email'] = decrypt_text(d.pop('email_enc'), key)
-    d['role'] = decrypt_text(d.pop('role_enc'), key)
+    d = dict(row)
+    try:
+        d['name'] = decrypt_text(d.pop('name_enc'), key)
+        d['email'] = decrypt_text(d.pop('email_enc'), key)
+        d['role'] = decrypt_text(d.pop('role_enc'), key)
+    except Exception as e:
+        logger.error(f"Ошибка расшифровки участника ID {d.get('id')}: {e}")
+        return None
     return d
 
-# --- CRUD для встреч (с шифрованием) ---
+def decrypt_profile(row, key):
+    if not row:
+        return None
+    d = dict(row)
+    d['name'] = decrypt_text(d.pop('name_enc'), key)
+    d['email'] = decrypt_text(d.pop('email_enc'), key)
+    d['phone'] = decrypt_text(d.pop('phone_enc'), key)
+    raw = decrypt_text(d.pop('raw_data_enc'), key)
+    d['raw_data'] = json.loads(raw) if raw else {}
+    return d
+
+# --- CRUD для встреч ---
 
 def get_all_meetings(key):
     try:
@@ -199,11 +233,7 @@ def get_all_meetings(key):
             c = conn.cursor()
             c.execute("SELECT id, title_enc, description_enc, start_time, end_time, status, created_at, updated_at FROM meetings ORDER BY created_at DESC")
             rows = c.fetchall()
-            meetings = []
-            for row in rows:
-                m = decrypt_meeting(row, key)
-                meetings.append(m)
-            return meetings
+            return [decrypt_meeting(r, key) for r in rows]
     except sqlite3.Error as e:
         logger.error(f"Ошибка получения встреч: {e}")
         raise HTTPException(500, "Ошибка БД")
@@ -217,10 +247,15 @@ def get_meeting(meeting_id, key):
             if not row:
                 raise HTTPException(404, "Встреча не найдена")
             meeting = decrypt_meeting(row, key)
-            # Загружаем участников
-            c.execute("SELECT id, meeting_id, name_enc, email_enc, role_enc FROM participants WHERE meeting_id = ?", (meeting_id,))
+            c.execute("SELECT id, meeting_id, name_enc, email_enc, role_enc, profile_id FROM participants WHERE meeting_id = ?", (meeting_id,))
             p_rows = c.fetchall()
-            meeting['participants'] = [decrypt_participant(p, key) for p in p_rows]
+            logger.info(f"Найдено участников в БД: {len(p_rows)}")
+            meeting['participants'] = []
+            for p in p_rows:
+                decrypted = decrypt_participant(p, key)
+                if decrypted:
+                    meeting['participants'].append(decrypted)
+            logger.info(f"После расшифровки осталось: {len(meeting['participants'])}")
             return meeting
     except sqlite3.Error as e:
         logger.error(f"Ошибка получения встречи {meeting_id}: {e}")
@@ -241,9 +276,10 @@ def create_meeting(title, description, start_time, end_time, status, participant
                 name_enc = encrypt_text(p.get('name', ''), key)
                 email_enc = encrypt_text(p.get('email', ''), key)
                 role_enc = encrypt_text(p.get('role', ''), key)
+                profile_id = p.get('profile_id', None)
                 c.execute(
-                    "INSERT INTO participants (meeting_id, name_enc, email_enc, role_enc) VALUES (?, ?, ?, ?)",
-                    (meeting_id, name_enc, email_enc, role_enc)
+                    "INSERT INTO participants (meeting_id, name_enc, email_enc, role_enc, profile_id) VALUES (?, ?, ?, ?, ?)",
+                    (meeting_id, name_enc, email_enc, role_enc, profile_id)
                 )
             conn.commit()
             return meeting_id
@@ -263,15 +299,15 @@ def update_meeting(meeting_id, title, description, start_time, end_time, status,
             )
             if c.rowcount == 0:
                 raise HTTPException(404, "Встреча не найдена")
-            # Удаляем старых участников
             c.execute("DELETE FROM participants WHERE meeting_id = ?", (meeting_id,))
             for p in participants:
                 name_enc = encrypt_text(p.get('name', ''), key)
                 email_enc = encrypt_text(p.get('email', ''), key)
                 role_enc = encrypt_text(p.get('role', ''), key)
+                profile_id = p.get('profile_id', None)
                 c.execute(
-                    "INSERT INTO participants (meeting_id, name_enc, email_enc, role_enc) VALUES (?, ?, ?, ?)",
-                    (meeting_id, name_enc, email_enc, role_enc)
+                    "INSERT INTO participants (meeting_id, name_enc, email_enc, role_enc, profile_id) VALUES (?, ?, ?, ?, ?)",
+                    (meeting_id, name_enc, email_enc, role_enc, profile_id)
                 )
             conn.commit()
     except sqlite3.Error as e:
@@ -290,14 +326,47 @@ def delete_meeting(meeting_id, key):
         logger.error(f"Ошибка удаления встречи {meeting_id}: {e}")
         raise HTTPException(500, "Ошибка БД")
 
-# --- Функции для черновиков (drafts) — они тоже шифруются? Нет, черновик содержит незашифрованные данные?
-# Лучше хранить черновики в зашифрованном виде, но для простоты оставим как есть,
-# так как они хранятся кратковременно и пользователь может не хотеть их шифровать.
-# Однако для конфиденциальности зашифруем и их.
-# Для черновиков используем те же функции шифрования.
+# --- CRUD для профилей ---
+
+def create_profile(name, email, phone, raw_data, key):
+    name_enc = encrypt_text(name, key)
+    email_enc = encrypt_text(email, key) if email else ''
+    phone_enc = encrypt_text(phone, key) if phone else ''
+    raw_data_enc = encrypt_text(json.dumps(raw_data, ensure_ascii=False), key) if raw_data else ''
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO profiles (name_enc, email_enc, phone_enc, raw_data_enc) VALUES (?, ?, ?, ?)",
+            (name_enc, email_enc, phone_enc, raw_data_enc)
+        )
+        conn.commit()
+        return c.lastrowid
+
+def get_profile(profile_id, key):
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name_enc, email_enc, phone_enc, raw_data_enc, last_updated FROM profiles WHERE id = ?", (profile_id,))
+        row = c.fetchone()
+        if not row:
+            return None
+        return decrypt_profile(row, key)
+
+def update_profile(profile_id, name, email, phone, raw_data, key):
+    name_enc = encrypt_text(name, key)
+    email_enc = encrypt_text(email, key) if email else ''
+    phone_enc = encrypt_text(phone, key) if phone else ''
+    raw_data_enc = encrypt_text(json.dumps(raw_data, ensure_ascii=False), key) if raw_data else ''
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE profiles SET name_enc = ?, email_enc = ?, phone_enc = ?, raw_data_enc = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?",
+            (name_enc, email_enc, phone_enc, raw_data_enc, profile_id)
+        )
+        conn.commit()
+
+# --- Функции для черновиков (автосохранение) ---
 
 def save_draft(meeting_id, user_id, draft_data, key):
-    # Сериализуем draft_data в JSON и шифруем целиком
     json_str = json.dumps(draft_data, ensure_ascii=False)
     encrypted = encrypt_text(json_str, key)
     try:
@@ -331,7 +400,7 @@ def get_draft(meeting_id, user_id, key):
         logger.error(f"Ошибка загрузки черновика: {e}")
         raise HTTPException(500, "Ошибка БД")
 
-# --- Middleware для установки user_id (без изменений) ---
+# --- Middleware для установки user_id ---
 @app.middleware("http")
 async def set_user_id(request: Request, call_next):
     user_id = request.cookies.get("user_id")
@@ -342,23 +411,16 @@ async def set_user_id(request: Request, call_next):
         return response
     return await call_next(request)
 
-# --- Проверка аутентификации (наличие ключа в сессии) ---
-# В FastAPI нет сессий, поэтому будем использовать глобальный словарь active_keys, привязанный к user_id.
-# При входе пользователь вводит пароль, мы вычисляем ключ и сохраняем в active_keys[user_id].
-# Для проверки используем декоратор или зависимость.
-
+# --- Проверка авторизации ---
 def get_key_from_request(request: Request):
     user_id = request.cookies.get("user_id")
     if not user_id:
         return None
-    key = active_keys.get(user_id)
-    if key is None:
-        return None
-    return key
+    return active_keys.get(user_id)
 
 # --- Роуты ---
 
-# 1. Главная страница — требует авторизации (если ключа нет — редирект на /login)
+# 1. Главная
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     key = get_key_from_request(request)
@@ -368,13 +430,12 @@ async def index(request: Request):
     template = env.get_template("index.html")
     return HTMLResponse(content=template.render(request=request, meetings=meetings))
 
-# 2. Страница входа (login)
+# 2. Логин
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: str = ""):
     template = env.get_template("login.html")
     return HTMLResponse(content=template.render(request=request, error=error))
 
-# 3. Обработка входа (POST)
 @app.post("/login")
 async def login(request: Request, password: str = Form(...)):
     if verify_password(password):
@@ -385,10 +446,8 @@ async def login(request: Request, password: str = Form(...)):
             response.set_cookie(key="user_id", value=user_id, max_age=365*24*60*60)
         else:
             response = RedirectResponse("/", status_code=303)
-        # Генерируем ключ и сохраняем
         key = get_key_for_user(user_id, password)
         active_keys[user_id] = key
-        # Обновляем last_login
         with get_db_connection() as conn:
             c = conn.cursor()
             c.execute("UPDATE secrets SET last_login = CURRENT_TIMESTAMP WHERE id = 1")
@@ -397,7 +456,6 @@ async def login(request: Request, password: str = Form(...)):
     else:
         return RedirectResponse("/login?error=Неверный пароль", status_code=303)
 
-# 4. Выход (удаляем ключ, но не пароль)
 @app.get("/logout")
 async def logout(request: Request):
     user_id = request.cookies.get("user_id")
@@ -405,13 +463,11 @@ async def logout(request: Request):
         del active_keys[user_id]
     return RedirectResponse("/login", status_code=303)
 
-# 5. Первоначальная настройка пароля (если ещё не задан)
+# 3. Установка пароля (первый запуск)
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request, error: str = ""):
-    # Проверяем, задан ли пароль
     salt_b64, _ = get_salt_and_hash()
     if salt_b64 and salt_b64 != '':
-        # Если пароль уже есть, редирект на логин
         return RedirectResponse("/login", status_code=303)
     template = env.get_template("setup.html")
     return HTMLResponse(content=template.render(request=request, error=error))
@@ -423,10 +479,9 @@ async def setup(request: Request, password: str = Form(...), confirm: str = Form
     if len(password) < 8:
         return RedirectResponse("/setup?error=Пароль должен быть не менее 8 символов", status_code=303)
     set_password(password)
-    # После установки пароля перенаправляем на логин
     return RedirectResponse("/login", status_code=303)
 
-# 6. Страницы встреч (требуют ключ)
+# 4. Страницы встреч
 @app.get("/meeting/new", response_class=HTMLResponse)
 async def new_meeting_page(request: Request):
     key = get_key_from_request(request)
@@ -466,7 +521,6 @@ async def create_meeting_route(
     except:
         participants = []
     meeting_id = create_meeting(title, description, start_time, end_time, status, participants, key)
-    # Очищаем черновик
     user_id = request.cookies.get("user_id")
     if user_id:
         with get_db_connection() as conn:
@@ -510,7 +564,7 @@ async def delete_meeting_route(request: Request, meeting_id: str):
     delete_meeting(meeting_id, key)
     return RedirectResponse("/", status_code=303)
 
-# 7. API для автосохранения (требует ключ)
+# 5. API для автосохранения
 @app.post("/api/meeting/autosave")
 async def autosave(request: Request):
     key = get_key_from_request(request)
@@ -538,32 +592,125 @@ async def get_draft_api(request: Request, meeting_id: str):
     else:
         return JSONResponse({"draft": None}, status_code=404)
 
-# --- 8. Экспорт всех данных (зашифрованный дамп) ---
+# 6. Yandex Search API – поиск информации о человеке
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY")
+YANDEX_FOLDER_ID = os.getenv("YANDEX_FOLDER_ID")
+
+@app.get("/api/yandex_search_person")
+async def yandex_search_person(request: Request, name: str, email: str = ""):
+    """
+    Ищет информацию о человеке через Yandex Search API (генеративный ответ).
+    Возвращает структурированное досье и список источников.
+    """
+    key = get_key_from_request(request)
+    if key is None:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    # Если API ключи не заданы – возвращаем тестовый ответ (заглушку)
+    if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
+        logger.warning("YANDEX_API_KEY или YANDEX_FOLDER_ID не заданы, возвращаем заглушку")
+        return JSONResponse({
+            "results": [{
+                "name": name,
+                "email": email,
+                "summary": "⚠️ Yandex API не настроен. Добавьте YANDEX_API_KEY и YANDEX_FOLDER_ID в .env",
+                "sources": []
+            }]
+        })
+
+    query = f"Расскажи подробно о человеке: {name} {email}. Укажи профессию, место работы, образование, известные публикации, ссылки на соцсети и любую другую публичную информацию."
+
+    # Документация Yandex Cloud AI Studio (YandexGPT + поиск)
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/generation"
+    headers = {
+        "Authorization": f"Api-Key {YANDEX_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "modelUri": f"gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.3,
+            "maxTokens": 2000
+        },
+        "messages": [
+            {
+                "role": "system",
+                "text": "Ты — помощник для сбора информации о людях из открытых источников. Отвечай структурированно и указывай источники."
+            },
+            {
+                "role": "user",
+                "text": query
+            }
+        ]
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            answer = data.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "Информация не найдена")
+            return JSONResponse({
+                "results": [{
+                    "name": name,
+                    "email": email,
+                    "summary": answer,
+                    "sources": []
+                }]
+            })
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Yandex API error: {e.response.text}")
+        return JSONResponse({"error": f"API error: {e.response.status_code}"}, status_code=500)
+    except Exception as e:
+        logger.error(f"Yandex Search error: {e}")
+        return JSONResponse({"error": "Search failed"}, status_code=500)
+
+# 7. Сохранение профиля (из результатов поиска)
+@app.post("/api/save_profile")
+async def save_profile(request: Request, profile_data: dict):
+    key = get_key_from_request(request)
+    if key is None:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    name = profile_data.get('name', '')
+    email = profile_data.get('email', '')
+    phone = profile_data.get('phone', '')
+    raw_data = profile_data.get('raw_data', {})
+    if not name:
+        return JSONResponse({"error": "Name required"}, status_code=400)
+    profile_id = create_profile(name, email, phone, raw_data, key)
+    return JSONResponse({"id": profile_id})
+
+# 8. Экспорт всех данных
 @app.get("/export")
 async def export_data(request: Request):
     key = get_key_from_request(request)
     if key is None:
         return RedirectResponse("/login", status_code=303)
-    # Собираем все встречи
     meetings = get_all_meetings(key)
     for m in meetings:
-        # Загружаем участников для каждой встречи
         m['participants'] = get_meeting(m['id'], key)['participants']
-    # Формируем JSON
-    json_data = json.dumps(meetings, ensure_ascii=False, indent=2)
-    # Шифруем тем же ключом
+    # Также экспортируем все профили
+    with get_db_connection() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, name_enc, email_enc, phone_enc, raw_data_enc FROM profiles")
+        rows = c.fetchall()
+        profiles = [decrypt_profile(r, key) for r in rows]
+    export_data = {
+        "meetings": meetings,
+        "profiles": profiles,
+        "exported_at": datetime.now().isoformat()
+    }
+    json_data = json.dumps(export_data, ensure_ascii=False, indent=2)
     encrypted = encrypt_text(json_data, key)
-    # Возвращаем как файл для скачивания
-    from fastapi.responses import Response
-    return Response(content=encrypted, media_type="application/octet-stream", headers={"Content-Disposition": "attachment; filename=trackmate_backup.enc"})
+    return Response(content=encrypted, media_type="application/octet-stream",
+                    headers={"Content-Disposition": "attachment; filename=trackmate_backup.enc"})
 
-# --- 9. Уничтожение всех данных (безвозвратно) ---
+# 9. Уничтожение данных
 @app.get("/destroy")
-async def destroy_data(request: Request):
+async def destroy_page(request: Request):
     key = get_key_from_request(request)
     if key is None:
         return RedirectResponse("/login", status_code=303)
-    # Запрашиваем подтверждение через шаблон
     template = env.get_template("destroy_confirm.html")
     return HTMLResponse(content=template.render(request=request))
 
@@ -574,66 +721,22 @@ async def destroy_confirm(request: Request, confirm: str = Form(...)):
     key = get_key_from_request(request)
     if key is None:
         return RedirectResponse("/login", status_code=303)
-    # 1. Удаляем все записи из таблиц
+    # Удаляем все данные
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM meetings")
         c.execute("DELETE FROM participants")
+        c.execute("DELETE FROM profiles")
         c.execute("DELETE FROM drafts")
-        # Обнуляем last_login, но не удаляем пароль (чтобы можно было восстановить, если пользователь передумал?)
-        # Но он хочет безвозвратно. Удалим и секреты.
         c.execute("DELETE FROM secrets")
         conn.commit()
-    # 2. Закрываем соединение и удаляем файл БД
-    # Принудительно закроем все соединения? Просто удалим файл.
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)
-    # 3. Удаляем ключ из памяти
     user_id = request.cookies.get("user_id")
     if user_id in active_keys:
         del active_keys[user_id]
-    # 4. Пересоздаём БД заново (чтобы приложение не упало)
     init_db()
-    # 5. Редирект на установку пароля (теперь он заново создастся)
     return RedirectResponse("/setup", status_code=303)
-
-# --- 10. Dead man's switch (опционально) — фоновый поток ---
-# Запускаем в отдельном потоке проверку last_login и отправку почты.
-# Для отправки почты нужно настроить SMTP.
-# Здесь я покажу только логику проверки, а отправку можно добавить.
-
-def deadman_switch_worker():
-    """Фоновый процесс, проверяющий каждые 24 часа, не прошло ли больше N дней с последнего входа."""
-    # Настройки: количество дней до тревоги (например, 30)
-    DEAD_DAYS = 30
-    while True:
-        try:
-            with get_db_connection() as conn:
-                c = conn.cursor()
-                c.execute("SELECT last_login, recovery_email FROM secrets WHERE id = 1")
-                row = c.fetchone()
-                if row:
-                    last_login_str = row['last_login']
-                    email = row['recovery_email']
-                    if last_login_str and email:
-                        last_login = datetime.fromisoformat(last_login_str)
-                        if datetime.now() - last_login > timedelta(days=DEAD_DAYS):
-                            logger.warning(f"Dead man's switch triggered! Last login was {last_login_str}. Sending email to {email}")
-                            # Здесь вызываем функцию отправки email с зашифрованным дампом
-                            # Нужно сгенерировать ключ? Но ключ может быть неизвестен, если пароль не введён.
-                            # Лучше заранее сохранить зашифрованный дамп при каждом изменении? Или использовать пароль, хранящийся в памяти?
-                            # Это сложно. Для простоты можно хранить резервную копию в отдельном файле, но это нарушает безопасность.
-                            # Я рекомендую не реализовывать автоматическую отправку, а оставить только ручной экспорт.
-                            # Но для полноты я оставлю заглушку.
-                            pass
-        except Exception as e:
-            logger.error(f"Dead man's switch error: {e}")
-        time.sleep(86400)  # 24 часа
-
-# Запуск фонового потока (если нужно)
-# import threading
-# t = threading.Thread(target=deadman_switch_worker, daemon=True)
-# t.start()
 
 # --- Запуск ---
 if __name__ == "__main__":

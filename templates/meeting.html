@@ -4,10 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>TrackMate - Встреча</title>
-    <!-- Подключаем Bootstrap для стилей -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        /* Стиль для уведомления о найденном черновике */
         .draft-notice {
             background: #fff3cd;
             padding: 10px;
@@ -15,18 +13,18 @@
             margin-bottom: 15px;
             border: 1px solid #ffc107;
         }
+        .profile-card {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            margin-top: 5px;
+        }
     </style>
 </head>
 <body>
 <div class="container mt-4">
-    <!-- Заголовок страницы: зависит от того, редактируем мы или создаём -->
     <h1>{% if meeting %}Редактирование встречи{% else %}Новая встреча{% endif %}</h1>
 
-    <!--
-      Блок уведомления о черновике.
-      Переменная draft приходит из маршрута, если для этого пользователя
-      и встречи есть сохранённый черновик.
-    -->
     {% if draft %}
     <div class="draft-notice">
         ⚡ <strong>Восстановлен черновик</strong> от {{ draft.updated_at }}.
@@ -35,27 +33,16 @@
     </div>
     {% endif %}
 
-    <!--
-      Форма отправки.
-      action зависит от того, есть ли уже встреча (meeting) – тогда идём на /meeting/<id>/edit,
-      иначе на /meeting/new (создание).
-    -->
     <form id="meetingForm" method="post" action="{% if meeting %}/meeting/{{ meeting.id }}/edit{% else %}/meeting/new{% endif %}">
-
-        <!-- Поле "Название" – обязательно для заполнения -->
         <div class="mb-3">
             <label for="title" class="form-label">Название *</label>
             <input type="text" id="title" name="title" class="form-control" required
                    value="{{ meeting.title if meeting else '' }}">
         </div>
-
-        <!-- Поле "Описание" – текстовое поле -->
         <div class="mb-3">
             <label for="description" class="form-label">Описание</label>
             <textarea id="description" name="description" class="form-control" rows="3">{{ meeting.description if meeting else '' }}</textarea>
         </div>
-
-        <!-- Дата и время начала / окончания (два поля в одной строке) -->
         <div class="row mb-3">
             <div class="col">
                 <label for="start_time" class="form-label">Начало</label>
@@ -68,8 +55,6 @@
                        value="{{ meeting.end_time if meeting else '' }}">
             </div>
         </div>
-
-        <!-- Выпадающий список статусов -->
         <div class="mb-3">
             <label for="status" class="form-label">Статус</label>
             <select id="status" name="status" class="form-select">
@@ -79,8 +64,6 @@
                 <option value="cancelled" {% if meeting and meeting.status == 'cancelled' %}selected{% endif %}>Отменена</option>
             </select>
         </div>
-
-        <!-- Поле для ввода участников – каждая строка: Имя, Email, Роль (роль необязательна) -->
         <div class="mb-3">
             <label for="participants" class="form-label">Участники (каждый с новой строки)</label>
             <textarea id="participants" name="participants" class="form-control" rows="4"
@@ -91,32 +74,92 @@
                     {% endfor %}
                 {% endif %}
             </textarea>
-            <small class="text-muted">
-                Формат: <strong>Имя</strong> (обязательно), Email, Роль – разделяйте запятыми. Можно указать только имя.
-            </small>
+            <small class="text-muted">Формат: <strong>Имя</strong> (обязательно), Email, Роль – разделяйте запятыми.</small>
         </div>
 
-        <!--
-          Скрытое поле, которое перед отправкой формы заполняется JSON-массивом участников.
-          Это нужно, чтобы передать структурированные данные на сервер.
-        -->
-        <input type="hidden" id="participants_json" name="participants_json" value="">
+        <!-- ========= БЛОК УЧАСТНИКОВ С ОТЛАДКОЙ ========= -->
+        {% if meeting %}
+        <div class="card mt-4">
+            <div class="card-header">📋 Информация об участниках</div>
+            <div class="card-body">
+                <!-- ОТЛАДКА: выводим количество участников в списке -->
+                <div class="alert alert-info">
+                    <strong>Отладка:</strong> участников в списке = {{ meeting.participants|length if meeting else 0 }}
+                </div>
 
-        <!-- Кнопки управления -->
-        <button type="submit" class="btn btn-success">Сохранить</button>
-        <a href="/" class="btn btn-secondary">Назад к списку</a>
+                <!-- Цикл по участникам -->
+                {% for participant in meeting.participants %}
+                <div class="mb-3 d-flex align-items-center justify-content-between">
+                    <div>
+                        <strong>{{ participant.name }}</strong>
+                        {% if participant.email %} ({{ participant.email }}){% endif %}
+                        {% if participant.role %} — {{ participant.role }}{% endif %}
+                    </div>
+                    <div>
+                        {% if participant.profile_id %}
+                            <a href="#" class="btn btn-sm btn-info" onclick="viewProfile({{ participant.profile_id }})">Посмотреть досье</a>
+                        {% else %}
+                            <button class="btn btn-sm btn-warning" onclick="aiSearchPerson('{{ participant.name }}', '{{ participant.email }}')">
+                                🤖 Найти ИИ
+                            </button>
+                        {% endif %}
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        <!-- ============================================ -->
+
+        <input type="hidden" id="participants_json" name="participants_json" value="">
+        <button type="submit" class="btn btn-success mt-3">Сохранить</button>
+        <a href="/" class="btn btn-secondary mt-3">Назад к списку</a>
     </form>
 </div>
 
-<!-- JavaScript для автосохранения и восстановления черновика -->
+<!-- Модальное окно для результатов ИИ-поиска -->
+<div class="modal fade" id="searchResultModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">🤖 Результаты ИИ-поиска</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="searchResults">
+                <!-- Сюда динамически вставляются результаты -->
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Закрыть</button>
+                <button type="button" class="btn btn-primary" id="saveProfileBtn" style="display:none;" onclick="saveSelectedProfile()">Сохранить в профиль</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Модальное окно для просмотра профиля -->
+<div class="modal fade" id="profileModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">📄 Досье</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body" id="profileContent">
+                <!-- Загружается динамически -->
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
-    // --- 1. ID текущей встречи (пустая строка, если создаём новую) ---
+    // --- Переменные ---
     let meetingId = "{{ meeting.id if meeting else '' }}";
+    let selectedProfileData = null;
 
+    // --- Автосохранение ---
     const form = document.getElementById('meetingForm');
-    let autosaveTimer;          // таймер для периодического автосохранения
+    let autosaveTimer;
 
-    // --- 2. Функция сбора всех данных из формы в объект ---
     function getFormData() {
         const title = document.getElementById('title').value;
         const description = document.getElementById('description').value;
@@ -124,10 +167,8 @@
         const end_time = document.getElementById('end_time').value;
         const status = document.getElementById('status').value;
         const participantsText = document.getElementById('participants').value;
-
-        // Парсим строки участников: каждая строка разделена запятыми
         const participants = participantsText.split('\n')
-            .filter(line => line.trim() !== '')                 // убираем пустые строки
+            .filter(line => line.trim() !== '')
             .map(line => {
                 const parts = line.split(',').map(s => s.trim());
                 return {
@@ -136,9 +177,8 @@
                     role: parts[2] || ''
                 };
             });
-
         return {
-            meeting_id: meetingId || null,      // если новая встреча – null
+            meeting_id: meetingId || null,
             title: title,
             description: description,
             start_time: start_time,
@@ -148,7 +188,6 @@
         };
     }
 
-    // --- 3. Функция сохранения черновика (отправка на сервер) ---
     function saveDraft() {
         const data = getFormData();
         fetch('/api/meeting/autosave', {
@@ -158,33 +197,26 @@
         }).catch(err => console.warn('Ошибка автосохранения:', err));
     }
 
-    // --- 4. Запуск периодического автосохранения (каждые 10 секунд) ---
     function startAutosave() {
         if (autosaveTimer) clearInterval(autosaveTimer);
         autosaveTimer = setInterval(saveDraft, 10000);
     }
 
-    // --- 5. Автосохранение при изменении любого поля (с задержкой 1 секунда) ---
     let changeTimeout;
     form.addEventListener('input', function() {
         clearTimeout(changeTimeout);
         changeTimeout = setTimeout(saveDraft, 1000);
     });
-
-    // Запускаем автосохранение при загрузке страницы
     startAutosave();
 
-    // --- 6. Перед отправкой формы преобразуем участников в JSON и записываем в скрытое поле ---
     form.addEventListener('submit', function(e) {
         const data = getFormData();
         document.getElementById('participants_json').value = JSON.stringify(data.participants);
-        // Останавливаем автосохранение, чтобы не мешать отправке
         clearInterval(autosaveTimer);
     });
 
-    // --- 7. Функция восстановления черновика (применяет сохранённые данные к полям формы) ---
+    // --- Восстановление черновика ---
     function applyDraft() {
-        // Получаем объект черновика из переменной, которую передал шаблон (если она есть)
         const draft = {{ draft.draft|tojson|safe if draft else 'null' }};
         if (draft) {
             document.getElementById('title').value = draft.title || '';
@@ -192,24 +224,94 @@
             document.getElementById('start_time').value = draft.start_time || '';
             document.getElementById('end_time').value = draft.end_time || '';
             document.getElementById('status').value = draft.status || 'planned';
-
-            // Восстанавливаем участников: из массива объектов делаем строки формата "Имя, Email, Роль"
             if (draft.participants) {
                 const lines = draft.participants.map(p => {
-                    // Собираем части, отфильтровывая пустые значения
                     return [p.name, p.email, p.role].filter(Boolean).join(', ');
                 }).join('\n');
                 document.getElementById('participants').value = lines;
             }
-
-            // Скрываем уведомление о черновике (чтобы не мешалось)
             const notice = document.querySelector('.draft-notice');
             if (notice) notice.style.display = 'none';
         }
     }
 
-    // Если черновик был показан при загрузке, кнопка "Применить" вызовет applyDraft().
-    // Можно также вызвать applyDraft() автоматически, но лучше оставить пользователю выбор.
+    // --- ИИ-поиск через Yandex Search API ---
+    async function aiSearchPerson(name, email) {
+        const query = `${name} ${email}`.trim();
+        if (!query) return alert('Недостаточно данных для поиска');
+
+        document.getElementById('searchResults').innerHTML = '<div class="text-center"><div class="spinner-border" role="status"></div><p>Ищем информацию через Яндекс...</p></div>';
+        var myModal = new bootstrap.Modal(document.getElementById('searchResultModal'));
+        myModal.show();
+
+        try {
+            const response = await fetch(`/api/yandex_search_person?name=${encodeURIComponent(name)}&email=${encodeURIComponent(email)}`);
+            const data = await response.json();
+            if (data.error) {
+                document.getElementById('searchResults').innerHTML = `<div class="alert alert-danger">${data.error}</div>`;
+                return;
+            }
+            if (data.results && data.results.length > 0) {
+                const item = data.results[0];
+                let html = `
+                    <div class="profile-card">
+                        <h5>${item.name || name}</h5>
+                        ${item.email ? `<p><strong>Email:</strong> ${item.email}</p>` : ''}
+                        <p><strong>Сводка:</strong></p>
+                        <p>${item.summary || 'Информация не найдена'}</p>
+                        ${item.sources && item.sources.length ? `<p><strong>Источники:</strong> ${item.sources.join(', ')}</p>` : ''}
+                        <button class="btn btn-success mt-2" onclick="selectProfile(${JSON.stringify(item).replace(/"/g, '&quot;')})">Сохранить этот профиль</button>
+                    </div>
+                `;
+                document.getElementById('searchResults').innerHTML = html;
+                window._selectedProfile = item;
+                document.getElementById('saveProfileBtn').style.display = 'block';
+            } else {
+                document.getElementById('searchResults').innerHTML = '<div class="alert alert-info">Ничего не найдено.</div>';
+            }
+        } catch (e) {
+            document.getElementById('searchResults').innerHTML = `<div class="alert alert-danger">Ошибка: ${e.message}</div>`;
+        }
+    }
+
+    function selectProfile(profile) {
+        window._selectedProfile = profile;
+        document.getElementById('saveProfileBtn').style.display = 'block';
+    }
+
+    async function saveSelectedProfile() {
+        const profile = window._selectedProfile;
+        if (!profile) return;
+        const payload = {
+            name: profile.name || '',
+            email: profile.email || '',
+            phone: profile.phone || '',
+            raw_data: profile
+        };
+        try {
+            const response = await fetch('/api/save_profile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await response.json();
+            if (data.id) {
+                alert('Профиль сохранён!');
+                location.reload();
+            } else {
+                alert('Ошибка сохранения: ' + (data.error || 'неизвестная ошибка'));
+            }
+        } catch (e) {
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    async function viewProfile(profileId) {
+        document.getElementById('profileContent').innerHTML = `<p>Загрузка профиля ${profileId}...</p>`;
+        var modal = new bootstrap.Modal(document.getElementById('profileModal'));
+        modal.show();
+        // Здесь можно реализовать fetch для получения данных профиля
+    }
 </script>
 
 </body>
