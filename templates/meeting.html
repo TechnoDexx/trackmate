@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TrackMate - Встреча</title>
+    <!-- Подключаем Bootstrap для стилей -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        /* Стиль для уведомления о найденном черновике */
+        .draft-notice {
+            background: #fff3cd;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+            border: 1px solid #ffc107;
+        }
+    </style>
+</head>
+<body>
+<div class="container mt-4">
+    <!-- Заголовок страницы: зависит от того, редактируем мы или создаём -->
+    <h1>{% if meeting %}Редактирование встречи{% else %}Новая встреча{% endif %}</h1>
+
+    <!--
+      Блок уведомления о черновике.
+      Переменная draft приходит из маршрута, если для этого пользователя
+      и встречи есть сохранённый черновик.
+    -->
+    {% if draft %}
+    <div class="draft-notice">
+        ⚡ <strong>Восстановлен черновик</strong> от {{ draft.updated_at }}.
+        <button class="btn btn-sm btn-warning" onclick="applyDraft()">Применить черновик</button>
+        <small class="text-muted">(черновик сохраняется автоматически каждые 10 секунд)</small>
+    </div>
+    {% endif %}
+
+    <!--
+      Форма отправки.
+      action зависит от того, есть ли уже встреча (meeting) – тогда идём на /meeting/<id>/edit,
+      иначе на /meeting/new (создание).
+    -->
+    <form id="meetingForm" method="post" action="{% if meeting %}/meeting/{{ meeting.id }}/edit{% else %}/meeting/new{% endif %}">
+
+        <!-- Поле "Название" – обязательно для заполнения -->
+        <div class="mb-3">
+            <label for="title" class="form-label">Название *</label>
+            <input type="text" id="title" name="title" class="form-control" required
+                   value="{{ meeting.title if meeting else '' }}">
+        </div>
+
+        <!-- Поле "Описание" – текстовое поле -->
+        <div class="mb-3">
+            <label for="description" class="form-label">Описание</label>
+            <textarea id="description" name="description" class="form-control" rows="3">{{ meeting.description if meeting else '' }}</textarea>
+        </div>
+
+        <!-- Дата и время начала / окончания (два поля в одной строке) -->
+        <div class="row mb-3">
+            <div class="col">
+                <label for="start_time" class="form-label">Начало</label>
+                <input type="datetime-local" id="start_time" name="start_time" class="form-control"
+                       value="{{ meeting.start_time if meeting else '' }}">
+            </div>
+            <div class="col">
+                <label for="end_time" class="form-label">Конец</label>
+                <input type="datetime-local" id="end_time" name="end_time" class="form-control"
+                       value="{{ meeting.end_time if meeting else '' }}">
+            </div>
+        </div>
+
+        <!-- Выпадающий список статусов -->
+        <div class="mb-3">
+            <label for="status" class="form-label">Статус</label>
+            <select id="status" name="status" class="form-select">
+                <option value="planned" {% if meeting and meeting.status == 'planned' %}selected{% endif %}>Запланирована</option>
+                <option value="ongoing" {% if meeting and meeting.status == 'ongoing' %}selected{% endif %}>В процессе</option>
+                <option value="finished" {% if meeting and meeting.status == 'finished' %}selected{% endif %}>Завершена</option>
+                <option value="cancelled" {% if meeting and meeting.status == 'cancelled' %}selected{% endif %}>Отменена</option>
+            </select>
+        </div>
+
+        <!-- Поле для ввода участников – каждая строка: Имя, Email, Роль (роль необязательна) -->
+        <div class="mb-3">
+            <label for="participants" class="form-label">Участники (каждый с новой строки)</label>
+            <textarea id="participants" name="participants" class="form-control" rows="4"
+                      placeholder="Иван Петров, ivan@example.com, Организатор&#10;Петр Сидоров, petr@example.com, Участник">
+                {% if meeting %}
+                    {% for p in meeting.participants %}
+                        {{ p.name }}, {{ p.email }}, {{ p.role }}
+                    {% endfor %}
+                {% endif %}
+            </textarea>
+            <small class="text-muted">
+                Формат: <strong>Имя</strong> (обязательно), Email, Роль – разделяйте запятыми. Можно указать только имя.
+            </small>
+        </div>
+
+        <!--
+          Скрытое поле, которое перед отправкой формы заполняется JSON-массивом участников.
+          Это нужно, чтобы передать структурированные данные на сервер.
+        -->
+        <input type="hidden" id="participants_json" name="participants_json" value="">
+
+        <!-- Кнопки управления -->
+        <button type="submit" class="btn btn-success">Сохранить</button>
+        <a href="/" class="btn btn-secondary">Назад к списку</a>
+    </form>
+</div>
+
+<!-- JavaScript для автосохранения и восстановления черновика -->
+<script>
+    // --- 1. ID текущей встречи (пустая строка, если создаём новую) ---
+    let meetingId = "{{ meeting.id if meeting else '' }}";
+
+    const form = document.getElementById('meetingForm');
+    let autosaveTimer;          // таймер для периодического автосохранения
+
+    // --- 2. Функция сбора всех данных из формы в объект ---
+    function getFormData() {
+        const title = document.getElementById('title').value;
+        const description = document.getElementById('description').value;
+        const start_time = document.getElementById('start_time').value;
+        const end_time = document.getElementById('end_time').value;
+        const status = document.getElementById('status').value;
+        const participantsText = document.getElementById('participants').value;
+
+        // Парсим строки участников: каждая строка разделена запятыми
+        const participants = participantsText.split('\n')
+            .filter(line => line.trim() !== '')                 // убираем пустые строки
+            .map(line => {
+                const parts = line.split(',').map(s => s.trim());
+                return {
+                    name: parts[0] || '',
+                    email: parts[1] || '',
+                    role: parts[2] || ''
+                };
+            });
+
+        return {
+            meeting_id: meetingId || null,      // если новая встреча – null
+            title: title,
+            description: description,
+            start_time: start_time,
+            end_time: end_time,
+            status: status,
+            participants: participants
+        };
+    }
+
+    // --- 3. Функция сохранения черновика (отправка на сервер) ---
+    function saveDraft() {
+        const data = getFormData();
+        fetch('/api/meeting/autosave', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+        }).catch(err => console.warn('Ошибка автосохранения:', err));
+    }
+
+    // --- 4. Запуск периодического автосохранения (каждые 10 секунд) ---
+    function startAutosave() {
+        if (autosaveTimer) clearInterval(autosaveTimer);
+        autosaveTimer = setInterval(saveDraft, 10000);
+    }
+
+    // --- 5. Автосохранение при изменении любого поля (с задержкой 1 секунда) ---
+    let changeTimeout;
+    form.addEventListener('input', function() {
+        clearTimeout(changeTimeout);
+        changeTimeout = setTimeout(saveDraft, 1000);
+    });
+
+    // Запускаем автосохранение при загрузке страницы
+    startAutosave();
+
+    // --- 6. Перед отправкой формы преобразуем участников в JSON и записываем в скрытое поле ---
+    form.addEventListener('submit', function(e) {
+        const data = getFormData();
+        document.getElementById('participants_json').value = JSON.stringify(data.participants);
+        // Останавливаем автосохранение, чтобы не мешать отправке
+        clearInterval(autosaveTimer);
+    });
+
+    // --- 7. Функция восстановления черновика (применяет сохранённые данные к полям формы) ---
+    function applyDraft() {
+        // Получаем объект черновика из переменной, которую передал шаблон (если она есть)
+        const draft = {{ draft.draft|tojson|safe if draft else 'null' }};
+        if (draft) {
+            document.getElementById('title').value = draft.title || '';
+            document.getElementById('description').value = draft.description || '';
+            document.getElementById('start_time').value = draft.start_time || '';
+            document.getElementById('end_time').value = draft.end_time || '';
+            document.getElementById('status').value = draft.status || 'planned';
+
+            // Восстанавливаем участников: из массива объектов делаем строки формата "Имя, Email, Роль"
+            if (draft.participants) {
+                const lines = draft.participants.map(p => {
+                    // Собираем части, отфильтровывая пустые значения
+                    return [p.name, p.email, p.role].filter(Boolean).join(', ');
+                }).join('\n');
+                document.getElementById('participants').value = lines;
+            }
+
+            // Скрываем уведомление о черновике (чтобы не мешалось)
+            const notice = document.querySelector('.draft-notice');
+            if (notice) notice.style.display = 'none';
+        }
+    }
+
+    // Если черновик был показан при загрузке, кнопка "Применить" вызовет applyDraft().
+    // Можно также вызвать applyDraft() автоматически, но лучше оставить пользователю выбор.
+</script>
+
+</body>
+</html>

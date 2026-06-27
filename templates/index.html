@@ -3,45 +3,58 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Мои контакты</title>
+    <title>TrackMate - Мои встречи</title>
+    <!-- Подключаем Bootstrap для стилей -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
 </head>
 <body>
 <div class="container mt-4">
-    <h1 class="mb-3">Контакты</h1>
-    <form action="/add" method="post" class="row g-3 mb-4">
-        <div class="col-auto"><input name="name" placeholder="Имя" required class="form-control"></div>
-        <div class="col-auto"><input name="phone" placeholder="Телефон" class="form-control"></div>
-        <div class="col-auto"><input name="email" placeholder="Email" class="form-control"></div>
-        <div class="col-auto"><input name="notes" placeholder="Заметки" class="form-control"></div>
-        <div class="col-auto"><input name="tags" placeholder="Теги" class="form-control"></div>
-        <div class="col-auto"><button type="submit" class="btn btn-primary">Добавить</button></div>
-    </form>
+    <!-- Заголовок и кнопка создания новой встречи -->
+    <h1 class="mb-3">📅 Мои встречи</h1>
+    <div class="mb-3">
+        <a href="/meeting/new" class="btn btn-primary">+ Создать встречу</a>
+        <!-- Кнопки для экспорта и уничтожения данных (добавлены по требованию параноика) -->
+        <a href="/export" class="btn btn-outline-success ms-2">📥 Экспортировать все данные (зашифровано)</a>
+        <a href="/destroy" class="btn btn-outline-danger ms-2">💣 Уничтожить все данные</a>
+    </div>
 
+    <!-- Таблица со списком всех встреч -->
     <table class="table table-striped">
         <thead>
             <tr>
-                <th>Имя</th>
-                <th>Телефон</th>
-                <th>Email</th>
-                <th>Заметки</th>
-                <th>Теги</th>
+                <th>Название</th>
+                <th>Статус</th>
+                <th>Начало</th>
+                <th>Конец</th>
                 <th>Действия</th>
             </tr>
         </thead>
         <tbody>
-        {% for contact in contacts %}
+        <!--
+          Перебираем список встреч, переданный из Python (переменная meetings).
+          Все поля уже расшифрованы на сервере, поэтому выводим их как есть.
+        -->
+        {% for meeting in meetings %}
         <tr>
-            <td>{{ contact.name }}</td>
-            <td>{{ contact.phone }}</td>
-            <td>{{ contact.email }}</td>
-            <td>{{ contact.notes }}</td>
-            <td>{{ contact.tags }}</td>
-            <td><a href="/delete/{{ contact.id }}" class="btn btn-danger btn-sm">Удалить</a></td>
+            <td>{{ meeting.title }}</td>
+            <td>{{ meeting.status }}</td>
+            <td>{{ meeting.start_time }}</td>
+            <td>{{ meeting.end_time }}</td>
+            <td>
+                <!-- Ссылка на страницу просмотра/редактирования встречи -->
+                <a href="/meeting/{{ meeting.id }}" class="btn btn-sm btn-info">Открыть</a>
+                <!-- Ссылка на удаление (с подтверждением) -->
+                <a href="/meeting/{{ meeting.id }}/delete" class="btn btn-sm btn-danger" onclick="return confirm('Удалить встречу?')">Удалить</a>
+            </td>
         </tr>
         {% endfor %}
         </tbody>
     </table>
+
+    <!-- Если встреч нет, выводим соответствующее сообщение -->
+    {% if meetings|length == 0 %}
+    <div class="alert alert-info mt-3">У вас пока нет встреч. Создайте первую!</div>
+    {% endif %}
 </div>
 </body>
 </html>

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>TrackMate - Уничтожение данных</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+<div class="container mt-5" style="max-width: 500px;">
+    <h2 class="text-danger">⚠️ Атомное уничтожение</h2>
+    <p>Вы собираетесь безвозвратно удалить все данные о встречах. Это действие невозможно отменить.</p>
+    <p>Чтобы подтвердить, введите слово <strong>УНИЧТОЖИТЬ</strong> в поле ниже.</p>
+    <form method="post" action="/destroy/confirm">
+        <div class="mb-3">
+            <input type="text" name="confirm" class="form-control" placeholder="Введите 'УНИЧТОЖИТЬ'">
+        </div>
+        <button type="submit" class="btn btn-danger w-100">Я подтверждаю уничтожение</button>
+        <a href="/" class="btn btn-secondary w-100 mt-2">Отмена</a>
+    </form>
+</div>
+</body>
+</html>
